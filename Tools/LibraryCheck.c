@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -112,79 +113,127 @@ static void CollectImport(const char* module, const char* name, void* context)
     entry->category = CATEGORY_PROVIDER;
 }
 
-static void CollectModule(struct Module* image, struct Module** visited, int* count)
+static int CollectModule(struct Module* image, struct Module*** visited, size_t* count, size_t* capacity)
 {
-  for (int index = 0; index < *count; index ++)
-    if (visited[index] == image)
-      return;
+  for (size_t index = 0; index < *count; index ++)
+    if ((*visited)[index] == image)
+      return 0;
 
-  visited[(*count) ++] = image;
+  if (*count == *capacity)
+  {
+    if (*capacity > SIZE_MAX / sizeof(**visited) / 2)
+      return -1;
+    size_t next = *capacity ? *capacity * 2 : 16;
+    struct Module** entries = realloc(*visited, next * sizeof(*entries));
+    if (entries == NULL)
+      return -1;
+    *visited = entries;
+    *capacity = next;
+  }
+
+  (*visited)[(*count) ++] = image;
   GetLibraryUnresolvedImports(image, CollectImport, NULL);
 
   for (size_t index = 0; index < image->number; index ++)
-    CollectModule(image->dependencies[index], visited, count);
+    if (CollectModule(image->dependencies[index], visited, count, capacity) < 0)
+      return -1;
+  return 0;
 }
 
 // DllMain in a child: the exit code tells the result, aborts of thunks come through stderr
 
-static void Attach(struct Module* image)
+static int Attach(struct Module* image)
 {
   char output[8192];
   int pipes[2];
   pid_t process;
   ssize_t length;
-  size_t total;
   int status;
+  pid_t waited;
+  int readError = 0;
 
   fflush(stdout);
 
   if (pipe(pipes) < 0)
-    return;
-
-  if ((process = fork()) == 0)
   {
-    dup2(pipes[1], STDERR_FILENO);
+    perror("pipe");
+    return 1;
+  }
+
+  process = fork();
+  if (process < 0)
+  {
+    perror("fork");
+    close(pipes[0]);
+    close(pipes[1]);
+    return 1;
+  }
+  if (process == 0)
+  {
+    close(pipes[0]);
+    if (pipes[1] != STDERR_FILENO)
+    {
+      if (dup2(pipes[1], STDERR_FILENO) < 0)
+        _exit(3);
+      close(pipes[1]);
+    }
     Direct = 1;
     _exit((AttachLibrary(image) == 0) ? 0 : 2);
   }
 
   close(pipes[1]);
-  total = 0;
-  while ((total + 1 < sizeof(output)) && ((length = read(pipes[0], output + total, sizeof(output) - total - 1)) > 0))
-    total += length;
-  output[total] = '\0';
+  do
+  {
+    length = read(pipes[0], output, sizeof(output));
+    if (length > 0)
+      fwrite(output, 1, length, stdout);
+  } while (length > 0 || (length < 0 && errno == EINTR));
+  if (length < 0)
+  {
+    perror("read");
+    readError = 1;
+  }
   close(pipes[0]);
-  waitpid(process, &status, 0);
+  do
+    waited = waitpid(process, &status, 0);
+  while (waited < 0 && errno == EINTR);
 
+  if (waited < 0)
+  {
+    perror("waitpid");
+    return 1;
+  }
   if (WIFEXITED(status) && (WEXITSTATUS(status) == 0))
     printf("DllMain:      OK (TLS callbacks and DllMain with DLL_PROCESS_ATTACH passed)\n");
-  else if (WIFEXITED(status))
+  else if (WIFEXITED(status) && (WEXITSTATUS(status) == 2))
     printf("DllMain:      returned FALSE\n");
-  else
+  else if (WIFSIGNALED(status))
     printf("DllMain:      killed by signal %d (%s)\n", WTERMSIG(status), strsignal(WTERMSIG(status)));
+  else
+    printf("DllMain:      child did not complete the attach check\n");
 
-  if (total > 0)
-    printf("%s", output);
+  return readError || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
 }
 
 int main(int argc, char** argv)
 {
   struct Module* image;
-  struct Module* visited[256];
+  struct Module** visited = NULL;
   const char* path;
   int attach;
-  int count;
+  size_t count = 0;
+  size_t capacity = 0;
+  int result = 0;
   int totals[CATEGORY_COUNT] = { 0 };
 
-  attach = (argc > 2) && (strcmp(argv[1], "--attach") == 0);
-  path   = argv[1 + attach];
+  attach = (argc > 1) && (strcmp(argv[1], "--attach") == 0);
 
-  if ((argc < 2) ||
-      (path == NULL))
+  if (argc != 2 + attach)
   {
     fprintf(stderr, "usage: loadlibrary-check [--attach] <dll>\n");
     return 2;
   }
+  path = argv[1 + attach];
 
   printf("DLL:          %s\n", path);
 
@@ -206,16 +255,22 @@ int main(int argc, char** argv)
   if (MessageLength > 0)
     printf("%s", Messages);
 
-  count = 0;
-  CollectModule(image, visited, &count);
+  if (CollectModule(image, &visited, &count, &capacity) < 0)
+  {
+    fprintf(stderr, "Unable to allocate dependency list\n");
+    free(visited);
+    FreeLibrary(image);
+    return 1;
+  }
 
   if (count > 1)
   {
     printf("Dependencies:");
-    for (int index = 1; index < count; index ++)
+    for (size_t index = 1; index < count; index ++)
       printf(" %s", visited[index]->name);
     printf("\n");
   }
+  free(visited);
 
   printf("Unresolved:   %d imports (they abort with their name when called)\n", EntryCount);
 
@@ -234,10 +289,12 @@ int main(int argc, char** argv)
   }
 
   if (attach)
-    Attach(image);
+    result = Attach(image);
 
   if (totals[CATEGORY_DYNAMIC_CRT] + totals[CATEGORY_SUBSYSTEM] > 0)
     printf("Verdict:      beyond the line, use Wine (imports of the dynamic CRT or of Windows subsystems)\n");
+  else if (result)
+    printf("Verdict:      loads, but the attach check failed\n");
   else if (EntryCount > 0)
     printf("Verdict:      loads; unresolved imports abort only when called. Check which ones the exports you need reach:\n"
            "              LibraryCheck.py %s <export>...\n", path);
@@ -245,5 +302,5 @@ int main(int argc, char** argv)
     printf("Verdict:      fits, every import is resolved\n");
 
   FreeLibrary(image);
-  return 0;
+  return result;
 }

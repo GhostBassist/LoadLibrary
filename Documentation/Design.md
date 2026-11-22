@@ -273,7 +273,7 @@ module gets:
   error paths need them), and the rest (candidates for a provider);
 - with `--attach`, `DllMain` runs in a child process (`AttachLibrary`): it
   passes, returns FALSE, or aborts on an unresolved import named in the
-  output.
+  output. A failed attach check exits with status 1.
 
 **`LibraryCheck.py library.dll [export ...]`** tells what the exports you
 need actually reach. It parses the PE, disassembles it with `objdump` (binutils
