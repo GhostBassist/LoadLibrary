@@ -1,0 +1,6 @@
+*.o
+Tools/loadlibrary-check
+Examples/call
+Tests/loadlibrary-test
+Tests/kernel32-test
+Tests/DLL/
