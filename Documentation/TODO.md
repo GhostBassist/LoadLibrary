@@ -5,25 +5,20 @@ now and for where the line with Wine is.
 
 ## LoadLibrary
 
-### Coverage of PE features (images that are not large address aware are beyond the line too)
-
-- **Not large address aware** images are refused. Fix: `MAP_32BIT` for the
-  image, and for every allocation a provider hands to it.
-
-### Beyond the line (decided: Wine, see "Where the line is" in LoadLibrary.md)
+### Beyond the line (decided: Wine)
 
 Exceptions, the dynamic CRT, real locales and `KUSER_SHARED_DATA` are what Wine is
-for. They stay here as a record of what a DLL may need, not as work to do.
+for. See [Where the line is](../README.md#where-the-line-is) for the supported scope.
 
-
+- **Images without large address awareness.** These require low addresses for
+  the image and for allocations the providers return to it.
 - **Locale and environment.** Code pages are Windows-1252, 437 and UTF-8,
   character types and case are Latin-1, `GetEnvironmentStrings` is empty.
 - **SEH and C++ exceptions** inside the DLL abort in `RtlUnwindEx` /
-  `RaiseException`. Fix: an unwinder over `.pdata`/`.xdata`. This is the
-  largest item here, do it only for a DLL that really throws.
+  `RaiseException`. Supporting them would require an unwinder over
+  `.pdata`/`.xdata`.
 - **`KUSER_SHARED_DATA` at `0x7ffe0000`.** Not mapped. Some code reads time
-  or CPU features from it. Fix: map a page there and keep the time fields
-  updated, only if a DLL reads it (grep the disassembly for `0x7ffe0`).
+  or CPU features from it.
 
 ### Diagnostics
 
