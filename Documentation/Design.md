@@ -396,7 +396,10 @@ Implemented now in `Kernel32.c`:
   `HeapAlloc`, `HeapFree`, `HeapReAlloc`, `HeapSize` (one heap on malloc);
 - thread storage: `TlsAlloc`, `TlsGetValue`, `TlsSetValue`, `TlsFree` (slots
   of the TEB), `FlsAlloc`, `FlsGetValue`, `FlsSetValue`, `FlsFree` (callbacks
-  at the exit of a prepared thread and in `FlsFree`);
+  at the exit of a prepared thread and for the calling thread in `FlsFree`).
+  Reused TLS indexes are cleared in every prepared TEB. FLS values belong to
+  their allocation, so a retired value on another thread is ignored on
+  lookup and at thread exit;
 - modules: `GetModuleHandleA`, `GetModuleHandleW`, `GetProcAddress` (emulated
   KERNEL32.dll and loaded images), `GetModuleFileNameA`,
   `DisableThreadLibraryCalls`;

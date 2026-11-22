@@ -66,6 +66,97 @@ static void* FlsThread(void* argument)
   return NULL;
 }
 
+struct SlotReuse
+{
+  pthread_barrier_t barrier;
+  uint32_t tls;
+  uint32_t fls;
+  int prepared;
+  int setReplacement;
+};
+
+static int ReplacementCalls;
+static void* ReplacementValue;
+
+static void LIBRARY_ABI ReplacementCallback(void* value)
+{
+  // Reenter the provider to check that callbacks run outside the slot lock.
+  void* (LIBRARY_ABI *flsGet)(uint32_t) = Find("FlsGetValue");
+  CHECK(flsGet(FlsIndex) == NULL);
+  ReplacementValue = value;
+  ReplacementCalls ++;
+}
+
+static void* SlotReuseThread(void* argument)
+{
+  struct SlotReuse* reuse = argument;
+  int32_t (LIBRARY_ABI *tlsSet)(uint32_t, void*) = Find("TlsSetValue");
+  void* (LIBRARY_ABI *tlsGet)(uint32_t) = Find("TlsGetValue");
+  void* (LIBRARY_ABI *flsGet)(uint32_t) = Find("FlsGetValue");
+  void* oldValue = &reuse->prepared;
+  void* newValue = &reuse->setReplacement;
+
+  if (reuse->prepared)
+    CHECK(PrepareLibraryThread() == 0);
+  uint8_t* teb = GetLibraryTEB();
+  CHECK(tlsSet(reuse->tls, oldValue) == 1);
+  CHECK(FlsSet(reuse->fls, oldValue) == 1);
+  CHECK(tlsGet(reuse->tls) == oldValue);
+  if (teb != NULL)
+    CHECK(((void**)(teb + LIBRARY_TEB_TLS_SLOTS))[reuse->tls] == oldValue);
+
+  pthread_barrier_wait(&reuse->barrier);
+  pthread_barrier_wait(&reuse->barrier);
+
+  // Check the raw TEB before using the API, so lazy invalidation cannot pass.
+  if (teb != NULL)
+    CHECK(((void**)(teb + LIBRARY_TEB_TLS_SLOTS))[reuse->tls] == NULL);
+  CHECK(tlsGet(reuse->tls) == NULL);
+  CHECK(flsGet(reuse->fls) == NULL);
+  CHECK(tlsSet(reuse->tls, newValue) == 1);
+  CHECK(tlsGet(reuse->tls) == newValue);
+  if (reuse->setReplacement)
+    CHECK(FlsSet(reuse->fls, reuse) == 1);
+  return NULL;
+}
+
+static void TestSlotReuse(int prepared, int setReplacement)
+{
+  uint32_t (LIBRARY_ABI *tlsAlloc)(void) = Find("TlsAlloc");
+  int32_t (LIBRARY_ABI *tlsFree)(uint32_t) = Find("TlsFree");
+  uint32_t (LIBRARY_ABI *flsAlloc)(void*) = Find("FlsAlloc");
+  int32_t (LIBRARY_ABI *flsFree)(uint32_t) = Find("FlsFree");
+  struct SlotReuse reuse = { .tls = tlsAlloc(), .fls = flsAlloc((void*)FlsCallbackFunction),
+                            .prepared = prepared, .setReplacement = setReplacement };
+  pthread_t worker;
+  int originalCalls = FlsCount;
+  ReplacementCalls = 0;
+  ReplacementValue = NULL;
+  CHECK(reuse.tls != UINT32_MAX && reuse.fls != UINT32_MAX);
+  if (reuse.tls == UINT32_MAX || reuse.fls == UINT32_MAX)
+    exit(EXIT_FAILURE);
+  if (pthread_barrier_init(&reuse.barrier, NULL, 2) != 0 ||
+      pthread_create(&worker, NULL, SlotReuseThread, &reuse) != 0)
+    exit(EXIT_FAILURE);
+
+  pthread_barrier_wait(&reuse.barrier);
+  int tlsFreed = tlsFree(reuse.tls);
+  int flsFreed = flsFree(reuse.fls);
+  uint32_t tlsReplacement = tlsAlloc();
+  FlsIndex = flsAlloc((void*)ReplacementCallback);
+  pthread_barrier_wait(&reuse.barrier);
+  pthread_join(worker, NULL);
+  pthread_barrier_destroy(&reuse.barrier);
+
+  CHECK(tlsFreed == 1 && flsFreed == 1);
+  CHECK(tlsReplacement == reuse.tls && FlsIndex == reuse.fls);
+  CHECK(FlsCount == originalCalls);
+  CHECK(ReplacementCalls == setReplacement);
+  CHECK(ReplacementValue == (setReplacement ? &reuse : NULL));
+  CHECK(tlsFree(tlsReplacement) == 1);
+  CHECK(flsFree(FlsIndex) == 1);
+}
+
 int main()
 {
   uint32_t (LIBRARY_ABI *getError)(void) = Find("GetLastError");
@@ -158,6 +249,10 @@ int main()
   CHECK(FlsSet(FlsIndex, (void*)0x5678) == 1);
   CHECK(flsFree(FlsIndex) == 1);
   CHECK((FlsCount == 2) && (FlsCalled[1] == (void*)0x5678));          // FlsFree of the calling thread
+
+  TestSlotReuse(0, 0); // Fallback TLS without a TEB
+  TestSlotReuse(1, 0); // Prepared thread exits with values from the retired allocation
+  TestSlotReuse(1, 1); // Prepared thread exits with a value owned by the replacement
 
   printf("Kernel32: %s\n", failures ? "FAILED" : "ok");
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;

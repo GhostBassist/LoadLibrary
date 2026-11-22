@@ -231,128 +231,179 @@ static size_t LIBRARY_ABI HeapSize(void* heap, uint32_t flags, const void* point
   return *(const size_t*)((const uint8_t*)pointer - HEAP_HEADER);
 }
 
-// Dynamic TLS (TlsAlloc): slots of the TEB, as in Windows, code may read them there directly; a thread without a TEB
-// keeps them in a thread-local array. FLS (FlsAlloc) lives in a thread-local array, its callbacks run at the exit of
-// a prepared thread for values that are still set, and in FlsFree() for the value of the calling thread
+// Prepared threads expose dynamic TLS through their TEB. The fallback TLS
+// values and all FLS values are tagged with the allocation that set them.
 
-#define TLS_OUT_OF_INDEXES           0xffffffff
-#define FLS_SLOT_COUNT               128
+#define TLS_OUT_OF_INDEXES  UINT32_MAX
+#define FLS_SLOT_COUNT      128
+#define ERROR_INVALID_PARAMETER 87
 
-static pthread_mutex_t SlotLock = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t TlsTaken[LIBRARY_TEB_TLS_SLOT_COUNT];
-static uint8_t FlsTaken[FLS_SLOT_COUNT];
-static __thread void* TlsValues[LIBRARY_TEB_TLS_SLOT_COUNT];
-static __thread void* FlsValues[FLS_SLOT_COUNT];
-static void* FlsCallbacks[FLS_SLOT_COUNT];
+struct Slot
+{
+  uint64_t generation;
+  int taken;
+};
+
+struct SlotValue
+{
+  uint64_t generation;
+  void* value;
+};
 
 typedef void (LIBRARY_ABI *FlsCallback)(void* value);
 
-static void CallFlsCallback(uint32_t index)
-{
-  void* value = FlsValues[index];
+static pthread_mutex_t SlotLock = PTHREAD_MUTEX_INITIALIZER;
+static struct Slot TlsSlots[LIBRARY_TEB_TLS_SLOT_COUNT];
+static struct Slot FlsSlots[FLS_SLOT_COUNT];
+static __thread struct SlotValue TlsValues[LIBRARY_TEB_TLS_SLOT_COUNT];
+static __thread struct SlotValue FlsValues[FLS_SLOT_COUNT];
+static FlsCallback FlsCallbacks[FLS_SLOT_COUNT];
 
-  if ((value != NULL) &&
-      (FlsCallbacks[index] != NULL))
-  {
-    FlsValues[index] = NULL;
-    ((FlsCallback)FlsCallbacks[index])(value);
-  }
+// Called with SlotLock held.
+static uint32_t AllocateSlot(struct Slot* slots, uint32_t count)
+{
+  for (uint32_t index = 0; index < count; index ++)
+    if (!slots[index].taken)
+    {
+      slots[index].generation ++;
+      slots[index].taken = 1;
+      return index;
+    }
+  return TLS_OUT_OF_INDEXES;
 }
 
-static void ReleaseFlsValues(void)
+static void* ReadSlotValue(const struct Slot* slot, const struct SlotValue* value)
 {
-  for (uint32_t index = 0; index < FLS_SLOT_COUNT; index ++)
-    CallFlsCallback(index);
-}
-
-static uint32_t AllocateSlot(uint8_t* taken, uint32_t count)
-{
-  uint32_t index;
-
-  pthread_mutex_lock(&SlotLock);
-  for (index = 0; (index < count) && (taken[index] != 0); index ++);
-  if (index < count)
-    taken[index] = 1;
-  pthread_mutex_unlock(&SlotLock);
-
-  return (index < count) ? index : TLS_OUT_OF_INDEXES;
-}
-
-static void** GetTlsSlot(uint32_t index)
-{
-  uint8_t* block = GetLibraryTEB();
-  return block ? (void**)(block + LIBRARY_TEB_TLS_SLOTS) + index : TlsValues + index;
+  return (slot->taken && slot->generation == value->generation) ? value->value : NULL;
 }
 
 static uint32_t LIBRARY_ABI TlsAlloc(void)
 {
-  return AllocateSlot(TlsTaken, LIBRARY_TEB_TLS_SLOT_COUNT);
+  pthread_mutex_lock(&SlotLock);
+  uint32_t index = AllocateSlot(TlsSlots, LIBRARY_TEB_TLS_SLOT_COUNT);
+  pthread_mutex_unlock(&SlotLock);
+  return index;
 }
 
 static void* LIBRARY_ABI TlsGetValue(uint32_t index)
 {
-  if (index >= LIBRARY_TEB_TLS_SLOT_COUNT)
-    return NULL;
+  void* value = NULL;
+  int valid = 0;
 
-  // Windows clears the last error on success
-  SetLastError(0);
-  return *GetTlsSlot(index);
+  pthread_mutex_lock(&SlotLock);
+  if (index < LIBRARY_TEB_TLS_SLOT_COUNT && TlsSlots[index].taken)
+  {
+    uint8_t* block = GetLibraryTEB();
+    value = block ? ((void**)(block + LIBRARY_TEB_TLS_SLOTS))[index] :
+                    ReadSlotValue(TlsSlots + index, TlsValues + index);
+    valid = 1;
+  }
+  pthread_mutex_unlock(&SlotLock);
+
+  SetLastError(valid ? 0 : ERROR_INVALID_PARAMETER);
+  return value;
 }
 
 static int32_t LIBRARY_ABI TlsSetValue(uint32_t index, void* value)
 {
-  if (index >= LIBRARY_TEB_TLS_SLOT_COUNT)
-    return 0;
+  int valid = 0;
 
-  *GetTlsSlot(index) = value;
-  return 1;
+  pthread_mutex_lock(&SlotLock);
+  if (index < LIBRARY_TEB_TLS_SLOT_COUNT && TlsSlots[index].taken)
+  {
+    uint8_t* block = GetLibraryTEB();
+    if (block != NULL)
+      ((void**)(block + LIBRARY_TEB_TLS_SLOTS))[index] = value;
+    else
+      TlsValues[index] = (struct SlotValue){ TlsSlots[index].generation, value };
+    valid = 1;
+  }
+  pthread_mutex_unlock(&SlotLock);
+
+  if (!valid)
+    SetLastError(ERROR_INVALID_PARAMETER);
+  return valid;
 }
 
 static int32_t LIBRARY_ABI TlsFree(uint32_t index)
 {
-  if (index >= LIBRARY_TEB_TLS_SLOT_COUNT)
-    return 0;
+  int valid = 0;
 
-  *GetTlsSlot(index) = NULL;
-  TlsTaken[index]    = 0;
-  return 1;
+  pthread_mutex_lock(&SlotLock);
+  if (index < LIBRARY_TEB_TLS_SLOT_COUNT && TlsSlots[index].taken)
+  {
+    ClearLibraryThreadTlsSlot(index);
+    TlsSlots[index].taken = 0;
+    valid = 1;
+  }
+  pthread_mutex_unlock(&SlotLock);
+
+  if (!valid)
+    SetLastError(ERROR_INVALID_PARAMETER);
+  return valid;
 }
 
 static uint32_t LIBRARY_ABI FlsAlloc(void* callback)
 {
-  uint32_t index = AllocateSlot(FlsTaken, FLS_SLOT_COUNT);
-
+  pthread_mutex_lock(&SlotLock);
+  uint32_t index = AllocateSlot(FlsSlots, FLS_SLOT_COUNT);
   if (index != TLS_OUT_OF_INDEXES)
-    FlsCallbacks[index] = callback;
-
+    FlsCallbacks[index] = (FlsCallback)callback;
+  pthread_mutex_unlock(&SlotLock);
   return index;
 }
 
 static void* LIBRARY_ABI FlsGetValue(uint32_t index)
 {
-  return (index < FLS_SLOT_COUNT) ? FlsValues[index] : NULL;
+  if (index >= FLS_SLOT_COUNT)
+    return NULL;
+
+  pthread_mutex_lock(&SlotLock);
+  void* value = ReadSlotValue(FlsSlots + index, FlsValues + index);
+  pthread_mutex_unlock(&SlotLock);
+  return value;
 }
 
 static int32_t LIBRARY_ABI FlsSetValue(uint32_t index, void* value)
 {
-  if (index >= FLS_SLOT_COUNT)
-    return 0;
+  pthread_mutex_lock(&SlotLock);
+  int valid = index < FLS_SLOT_COUNT && FlsSlots[index].taken;
+  if (valid)
+    FlsValues[index] = (struct SlotValue){ FlsSlots[index].generation, value };
+  pthread_mutex_unlock(&SlotLock);
+  return valid;
+}
 
-  FlsValues[index] = value;
-  return 1;
+// Claim only the current allocation's value and callback. Run DLL code
+// outside SlotLock so a callback can call back into the provider.
+static int ReleaseFlsValue(uint32_t index, int freeSlot)
+{
+  pthread_mutex_lock(&SlotLock);
+  int valid = FlsSlots[index].taken;
+  void* value = ReadSlotValue(FlsSlots + index, FlsValues + index);
+  FlsCallback callback = FlsCallbacks[index];
+  FlsValues[index].value = NULL;
+  if (freeSlot && valid)
+  {
+    FlsSlots[index].taken = 0;
+    FlsCallbacks[index] = NULL;
+  }
+  pthread_mutex_unlock(&SlotLock);
+
+  if (value != NULL && callback != NULL)
+    callback(value);
+  return valid;
+}
+
+static void ReleaseFlsValues(void)
+{
+  for (uint32_t index = 0; index < FLS_SLOT_COUNT; index ++)
+    ReleaseFlsValue(index, 0);
 }
 
 static int32_t LIBRARY_ABI FlsFree(uint32_t index)
 {
-  if (index >= FLS_SLOT_COUNT)
-    return 0;
-
-  CallFlsCallback(index);
-
-  FlsValues[index]    = NULL;
-  FlsCallbacks[index] = NULL;
-  FlsTaken[index]     = 0;
-  return 1;
+  return index < FLS_SLOT_COUNT && ReleaseFlsValue(index, 1);
 }
 
 // Modules: KERNEL32.dll is a handle of its own, other handles are bases of images loaded by LoadLibrary

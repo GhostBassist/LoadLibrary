@@ -157,6 +157,8 @@ struct Module* GetLibraryByName(const char* name);
 
 uint8_t* GetLibraryTEB(void);
 uint8_t* GetLibraryPEB(void);
+// Clear a retired dynamic TLS slot before republishing its index.
+void ClearLibraryThreadTlsSlot(unsigned int index);
 
 // Replace exactly one occurrence of the pattern inside executable sections, returns count of found occurrences
 // Protection of the page is lifted for the write and restored

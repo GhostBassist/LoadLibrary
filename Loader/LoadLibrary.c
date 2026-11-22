@@ -211,6 +211,7 @@ typedef int32_t (LIBRARY_ABI *EntryPoint)(void* module, uint32_t reason, void* r
 
 static uint8_t LibraryPEB[PEB_SIZE] __attribute__((aligned(64)));
 static pthread_key_t LibraryKey;
+static int LibraryKeyError;
 static pthread_once_t LibraryOnce = PTHREAD_ONCE_INIT;
 
 // Global state changes (a module with TLS loaded or freed, a module attached) bump the generation, every thread
@@ -225,6 +226,18 @@ static uint32_t Generation = 1;                   //
 static LibraryThreadExit ExitFunctions[EXIT_FUNCTION_COUNT];
 
 static __thread uint8_t* LibraryTEB = NULL;
+
+// Independent of LibraryLock so a provider can clear dynamic TLS while
+// holding its slot lock, including from a loader notification.
+struct ThreadTEB
+{
+  uint8_t* block;
+  struct ThreadTEB* next;
+};
+
+static pthread_mutex_t ThreadTEBLock = PTHREAD_MUTEX_INITIALIZER;
+static struct ThreadTEB* ThreadTEBs;
+static __thread struct ThreadTEB CurrentTEB;
 static __thread uint32_t ThreadGeneration = 0;    // Generation the thread is synchronized to
 static __thread uint64_t ThreadSerial = 0;        // Attachments up to this serial were notified in the thread
 static __thread uint64_t ThreadOwners[TLS_SLOT_COUNT];  // Serial of the module each TLS block was made for
@@ -324,6 +337,13 @@ static void ReleaseTEB(void* argument)
 
   pthread_mutex_unlock(&LibraryLock);
 
+  pthread_mutex_lock(&ThreadTEBLock);
+  struct ThreadTEB** link = &ThreadTEBs;
+  while (*link != &CurrentTEB)
+    link = &(*link)->next;
+  *link = CurrentTEB.next;
+  pthread_mutex_unlock(&ThreadTEBLock);
+
   free(blocks);
   free(argument);
   LibraryTEB = NULL;
@@ -339,7 +359,7 @@ static void InitializeEnvironment(void)
   *(uint16_t*)(LibraryPEB + PEB_OS_BUILD_NUMBER)      = 19045;
   *(uint32_t*)(LibraryPEB + PEB_OS_PLATFORM_ID)       = 2;      // VER_PLATFORM_WIN32_NT
 
-  pthread_key_create(&LibraryKey, ReleaseTEB);
+  LibraryKeyError = pthread_key_create(&LibraryKey, ReleaseTEB);
 }
 
 int RegisterLibraryThreadExit(LibraryThreadExit function)
@@ -360,6 +380,17 @@ int RegisterLibraryThreadExit(LibraryThreadExit function)
 uint8_t* GetLibraryTEB(void)
 {
   return LibraryTEB;
+}
+
+void ClearLibraryThreadTlsSlot(unsigned int index)
+{
+  if (index >= LIBRARY_TEB_TLS_SLOT_COUNT)
+    return;
+
+  pthread_mutex_lock(&ThreadTEBLock);
+  for (struct ThreadTEB* thread = ThreadTEBs; thread != NULL; thread = thread->next)
+    ((void**)(thread->block + LIBRARY_TEB_TLS_SLOTS))[index] = NULL;
+  pthread_mutex_unlock(&ThreadTEBLock);
 }
 
 uint8_t* GetLibraryPEB(void)
@@ -384,6 +415,9 @@ int PrepareLibraryThread(void)
 
   if (LibraryTEB == NULL)
   {
+    if (LibraryKeyError != 0)
+      return -1;
+
     block  = (uint8_t*)calloc(1, TEB_SIZE);
     blocks = (void**)calloc(TLS_SLOT_COUNT, sizeof(void*));
 
@@ -414,15 +448,26 @@ int PrepareLibraryThread(void)
     WRITE64(block + TEB_TLS_POINTER, (uint64_t)blocks);
     WRITE64(block + TEB_PEB,         (uint64_t)LibraryPEB);
 
-    if (syscall(SYS_arch_prctl, ARCH_SET_GS, block) < 0)
+    if (pthread_setspecific(LibraryKey, block) != 0)
     {
       free(block);
       free(blocks);
       return -1;
     }
+    if (syscall(SYS_arch_prctl, ARCH_SET_GS, block) < 0)
+    {
+      pthread_setspecific(LibraryKey, NULL);
+      free(block);
+      free(blocks);
+      return -1;
+    }
 
-    pthread_setspecific(LibraryKey, block);
     LibraryTEB = block;
+    pthread_mutex_lock(&ThreadTEBLock);
+    CurrentTEB.block = block;
+    CurrentTEB.next = ThreadTEBs;
+    ThreadTEBs = &CurrentTEB;
+    pthread_mutex_unlock(&ThreadTEBLock);
   }
 
   pthread_mutex_lock(&LibraryLock);
